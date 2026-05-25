@@ -1,14 +1,9 @@
 // ============================================================
-//  FreeFEM++  --  NEWTON MONOLITHIQUE 2 CORPS (particule + substrat)
-//  Stage 1 : Stokes (charge fluide sur label 3)
-//  Stage 2 : un seul systeme tangent [[KPP,KPS],[KSP,KSS]] par iteration
-//            couplage interface par matrice d'interpolation R (WS->WP)
-//
-//  CORRECTIONS :
-//  1. Blocage translation rigide particule (penalisation centre de masse)
-//  2. Signe du transfert interface rS : rS -= rStr (reaction Newton)
-//  3. Blocs croises KPS=+R'*MP (signe corrige)
-//  4. Facteur d'amplification automatique maillage deforme
+//  FreeFEM++  --  NEWTON MONOLITHIQUE 2 CORPS
+//  CORRECTION FINALE :
+//  - epsRigid dans KPP uniquement (regularisation matrice)
+//  - residu physique SANS epsRigid (bilan correct)
+//  - rS -= rStr (action/reaction)
 // ============================================================
 verbosity = 0;
 load "iovtk"
@@ -82,7 +77,9 @@ real epsLJ=1e-3, d0=0.2;
 real muFric=0.3, epsT=1e-3, ktTang0=1e-2;
 int  iterMax=40;
 real tol=1e-8, alpha=1.0;
-real epsRigid = 1e-4 * muP;
+// epsRigid : regularisation UNIQUEMENT dans la matrice tangente
+// suffisamment petit pour ne pas perturber la physique
+real epsRigid = 1e-6 * muP;
 func f1=0.;
 func f2=0.;
 
@@ -121,7 +118,6 @@ WP [u1,u2]=[0,0];  WP [uSb1,uSb2]=[0,0];
 WS [uS1,uS2]=[0,0];
 int ndP = WP.ndof, ndS = WS.ndof;
 
-// --- matrice d'interpolation interface (WS -> WP), construite UNE fois
 matrix R = interpolate(WP, WS);
 
 // --- macros
@@ -136,16 +132,13 @@ macro FLJ(uu)   ( 12.*epsLJ/d0*( pow(d0/dLJ(uu),13) - pow(d0/dLJ(uu),7) ) ) //
 macro KappaLJ(uu)
 ( 12.*epsLJ/(d0*d0)*( 13.*pow(d0/dLJ(uu),14) - 7.*pow(d0/dLJ(uu),8) ) ) //
 
-// --- champs d'interface (recalcules chaque iteration)
 PhP sepP, FNp, KNp, gtP, pNp, tauP, KfP;
 
 cout << "=== Newton monolithique 2 corps ===" << endl;
 for(int k=0; k<iterMax; k++)
 {
-    // ---- substrat interpole sur la particule (interface) ----
     uSb1[] = R * uS1[];
 
-    // ---- lois d'interface + tangentes ----
     sepP = min(max(d0 + (u2 - uSb2), 0.3*d0), 5.*d0);
     FNp  = 12.*epsLJ/d0*( (d0/sepP)^13 - (d0/sepP)^7 );
     KNp  = 12.*epsLJ/(d0*d0)*( 13.*(d0/sepP)^14 - 7.*(d0/sepP)^8 );
@@ -154,7 +147,9 @@ for(int k=0; k<iterMax; k++)
     tauP = -muFric*pNp*tanh(gtP/epsT) - ktTang0*gtP;
     KfP  = muFric*pNp/epsT*(1.-tanh(gtP/epsT)^2) + ktTang0;
 
-    // ---- blocs tangents diagonaux ----
+    // ---- matrice tangente particule
+    // epsRigid UNIQUEMENT ici pour regulariser le systeme singulier
+    // valeur 1e-6*muP : negligeable devant la rigidite elastique
     varf vaP([du1,du2],[v1,v2]) =
         int2d(ThP)( Abil(du1,du2,v1,v2,lamP,muP)
                   + epsRigid*(du1*v1 + du2*v2) )
@@ -166,13 +161,11 @@ for(int k=0; k<iterMax; k++)
       + on(14, du1=0, du2=0);
     matrix KSbulk = vaS(WS,WS);
 
-    // ---- raideur d'interface ----
     varf vMP([du1,du2],[v1,v2])  = int1d(ThP,1)(  KfP*du1*v1 + KNp*du2*v2 );
     varf vMPn([du1,du2],[v1,v2]) = int1d(ThP,1)( -KfP*du1*v1 - KNp*du2*v2 );
     matrix MP  = vMP(WP,WP);
     matrix MPn = vMPn(WP,WP);
 
-    // ---- blocs croises ----
     matrix MPR   = MP * R;
     matrix KPP   = KPbulk + MP;
     matrix KPS   = MPn * R;
@@ -183,10 +176,9 @@ for(int k=0; k<iterMax; k++)
     matrix KK = [[KPP, KPS],[KSP, KSS]];
     set(KK, solver=UMFPACK);
 
-    // ---- residus particule ----
+    // ---- residu particule : SANS epsRigid (physique pur)
     varf vLP([du1,du2],[v1,v2]) =
-        int2d(ThP)( Abil(u1,u2,v1,v2,lamP,muP)
-                  + epsRigid*(u1*v1 + u2*v2) )
+        int2d(ThP)( Abil(u1,u2,v1,v2,lamP,muP) )
       - int2d(ThP)( f1*v1 + f2*v2 )
       - int1d(ThP,3)( coupling*( (SxxF*N.x+SxyF*N.y)*v1
                                + (SxyF*N.x+SyyF*N.y)*v2 ) )
@@ -194,7 +186,7 @@ for(int k=0; k<iterMax; k++)
       - int1d(ThP,1)( FNp*v2 + tauP*v1 );
     real[int] rP = vLP(0,WP);
 
-    // ---- residus substrat ----
+    // ---- residu substrat ----
     varf vLS([du1,du2],[v1,v2]) =
         int2d(ThSub)( Abil(uS1,uS2,v1,v2,lamS,muS) )
       + on(14, du1=0, du2=0);
@@ -206,7 +198,6 @@ for(int k=0; k<iterMax; k++)
     real[int] rS    = rSb;
     rS -= rStr;
 
-    // ---- second membre global ----
     real[int] RHS(ndP+ndS);
     RHS(0:ndP-1)       = rP;
     RHS(ndP:ndP+ndS-1) = rS;
@@ -214,7 +205,6 @@ for(int k=0; k<iterMax; k++)
 
     real[int] sol = KK^-1 * RHS;
 
-    // ---- mise a jour ----
     real[int] dP = sol(0:ndP-1);
     real[int] dS = sol(ndP:ndP+ndS-1);
     u1[]  += alpha*dP;
@@ -223,9 +213,10 @@ for(int k=0; k<iterMax; k++)
     real ndu    = sol.l2;
     real nuu    = u1[].l2 + uS1[].l2 + 1e-30;
     real relErr = alpha*ndu/nuu;
-    cout << "iter=" << k+1 << "  relErr=" << relErr << "  ||du||=" << ndu << endl;
+    cout << "iter=" << k+1 << "  relErr=" << relErr
+         << "  ||du||=" << ndu << endl;
     if(relErr < tol){ cout << "Convergence atteinte." << endl; break; }
-    if(k==iterMax-1) cout << "Non converge (baisser alpha ~0.5)." << endl;
+    if(k==iterMax-1) cout << "Non converge (essayer alpha=0.5)." << endl;
 }
 
 // ================= BILAN + POST =================
@@ -240,7 +231,7 @@ cout << "=== Bilan particule ===" << endl;
 cout << " F_fluide   Fx=" << FfluX  << "  Fy=" << FfluY  << endl;
 cout << " F_adh(1)   Fy=" << Fadh1Y << "  F_frot Fx=" << FfrotX << endl;
 cout << " F_resultante Fx=" << FresX << "  Fy=" << FresY
-     << "  (doit etre ~0 si equilibre)" << endl;
+     << "  (doit etre ~0)" << endl;
 
 PhP s11P=lamP*(dx(u1)+dy(u2))+2.*muP*dx(u1);
 PhP s22P=lamP*(dx(u1)+dy(u2))+2.*muP*dy(u2);
@@ -250,7 +241,8 @@ PhS s11S=lamS*(dx(uS1)+dy(uS2))+2.*muS*dx(uS1);
 PhS s22S=lamS*(dx(uS1)+dy(uS2))+2.*muS*dy(uS2);
 PhS s12S=muS*(dy(uS1)+dx(uS2));
 PhS vmS =sqrt( s11S^2 - s11S*s22S + s22S^2 + 3.*s12S^2 );
-cout << "VM max particule = " << vmP[].max << "   substrat = " << vmS[].max << endl;
+cout << "VM max particule = " << vmP[].max
+     << "   substrat = " << vmS[].max << endl;
 
 plot([u1,u2],   wait=true, fill=true, value=true, cmm="Deplacement particule");
 plot([uS1,uS2], wait=true, fill=true, value=true, cmm="Deplacement substrat");
@@ -264,14 +256,14 @@ real uMaxG = max(uMaxP, uMaxS) + 1e-30;
 real scaleAuto = 0.20 * d / uMaxG;
 real scaleP = min(scaleAuto, 1e4);
 real scaleS = min(scaleAuto, 1e4);
-cout << "Facteur amplification maillage deforme : " << scaleP << endl;
+cout << "Facteur amplification : " << scaleP << endl;
 
-mesh ThPdef = movemesh(ThP,   [x + scaleP*u1,  y + scaleP*u2 ]);
+mesh ThPdef = movemesh(ThP,   [x + scaleP*u1,  y + scaleP*u2]);
 mesh ThSdef = movemesh(ThSub, [x + scaleS*uS1, y + scaleS*uS2]);
-
-plot(ThPdef, wait=true, cmm="Maillage deforme particule  (x"+scaleP+")");
-plot(ThSdef, wait=true, cmm="Maillage deforme substrat   (x"+scaleS+")");
-plot(ThPdef, ThSdef, wait=true, cmm="Maillages deformes particule + substrat (x"+scaleP+")");
+plot(ThPdef, wait=true, cmm="Maillage deforme particule (x"+scaleP+")");
+plot(ThSdef, wait=true, cmm="Maillage deforme substrat  (x"+scaleS+")");
+plot(ThPdef, ThSdef, wait=true,
+     cmm="Maillages deformes particule + substrat (x"+scaleP+")");
 
 // ================= EXPORT VTK =================
 savevtk("particule_"+Name+".vtk", ThP, [u1,u2,0], vmP, s11P,s22P,s12P,
